@@ -1,0 +1,691 @@
+"""
+Energy Waste Demo (Final Optimized Version)
+- Smart Priority Logic: Critical waste is always HIGH.
+- Realistic Efficiency Score: Scales gently based on active alerts.
+- Correct Time Calculation: Simulated minutes calculated correctly.
+- Clean & Bright UI: Professional dashboard updates smoothly.
+
+Dependencies:
+    pip install fastapi uvicorn pandas scikit-learn websockets
+
+Run:
+    python energy_waste_demo.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import uuid
+from collections import defaultdict, deque
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from typing import Any
+
+import pandas as pd
+import websockets
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from sklearn.linear_model import LinearRegression
+
+# -----------------------------
+# Config
+# -----------------------------
+TARIFF_RUPEES_PER_KWH = 8.0
+TICK_SECONDS = 5          # 1 tick = 5 real seconds
+SIM_MINUTES_PER_TICK = 5  # 1 tick = 5 simulated minutes
+# RESULT: 1 Real Second = 1 Simulated Minute
+
+BUILDING_ID = "B1"
+DEVICES = ["HVAC"]
+ROOMS = [
+    (1, "101"),
+    (1, "102"),
+    (2, "215"),
+    (3, "342"),
+    (3, "343"),
+]
+SOURCES = ["PIR", "Camera", "Wifi", "Badge"]
+SOURCE_WEIGHTS = {"PIR": 0.4, "Camera": 0.3, "Wifi": 0.2, "Badge": 0.1}
+
+# -----------------------------
+# Dashboard UI
+# -----------------------------
+html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Energy Command Center</title>
+    <style>
+        :root {
+            --bg-color: #f3f4f6;
+            --card-bg: #ffffff;
+            --text-primary: #1f2937;
+            --text-secondary: #6b7280;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-yellow: #f59e0b;
+            --border-color: #e5e7eb;
+        }
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .container { width: 100%; max-width: 1000px; }
+        
+        header {
+            background: var(--card-bg);
+            padding: 20px 30px;
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+        }
+        h1 { margin: 0; font-size: 1.5rem; font-weight: 700; color: #111827; }
+        
+        .status-badge {
+            background: #ecfdf5;
+            color: var(--accent-green);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            border: 1px solid #d1fae5;
+        }
+        .status-dot {
+            width: 8px; height: 8px; background: var(--accent-green);
+            border-radius: 50%;
+            box-shadow: 0 0 0 2px #d1fae5;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .summary-card {
+            background: var(--card-bg);
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border: 1px solid var(--border-color);
+        }
+        .summary-value { font-size: 2rem; font-weight: 800; margin: 10px 0; color: #111827; }
+        .summary-label { color: var(--text-secondary); font-size: 0.8rem; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
+
+        .feed-title {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            margin-bottom: 15px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-left: 5px;
+        }
+
+        #alerts { display: flex; flex-direction: column; gap: 15px; }
+
+        .alert-card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 24px;
+            border-left: 5px solid var(--accent-green);
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 15px;
+            align-items: start;
+            animation: slideIn 0.4s ease-out;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+            border: 1px solid var(--border-color);
+        }
+        @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+
+        .alert-card.HIGH { border-left-color: var(--accent-red); }
+        .alert-card.MED { border-left-color: var(--accent-yellow); }
+        .alert-card.LOW { border-left-color: var(--accent-green); }
+
+        .alert-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+        .alert-location { font-weight: 700; font-size: 1.1rem; color: #111827; }
+        .alert-time { color: var(--text-secondary); font-size: 0.85rem; }
+        .alert-message { color: #374151; line-height: 1.5; margin-bottom: 15px; font-size: 1rem; }
+
+        .alert-stats {
+            display: flex;
+            gap: 15px;
+            font-size: 0.9rem;
+            color: #4b5563;
+            background: #f9fafb;
+            padding: 10px;
+            border-radius: 8px;
+            width: fit-content;
+        }
+        .stat-item { display: flex; align-items: center; gap: 5px; }
+        .cost-highlight { color: #b91c1c; font-weight: 700; }
+
+        .priority-badge {
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 0.75rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .HIGH .priority-badge { background: #fef2f2; color: var(--accent-red); border: 1px solid #fee2e2; }
+        .MED .priority-badge { background: #fffbeb; color: var(--accent-yellow); border: 1px solid #fef3c7; }
+        .LOW .priority-badge { background: #ecfdf5; color: var(--accent-green); border: 1px solid #d1fae5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⚡ Energy Command Center</h1>
+            <div id="connection-status" class="status-badge">
+                <div class="status-dot"></div> System Online
+            </div>
+        </header>
+
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="summary-label">Active Anomalies</div>
+                <div id="total-alerts" class="summary-value">0</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Estimated Waste Cost</div>
+                <div id="total-cost" class="summary-value" style="color: var(--accent-red);">₹0.00</div>
+            </div>
+            <div class="summary-card">
+                <div class="summary-label">Efficiency Score</div>
+                <div id="efficiency-score" class="summary-value" style="color: var(--accent-green);">100%</div>
+            </div>
+        </div>
+
+        <div class="feed-title">Live Anomaly Feed</div>
+        <div id="alerts"></div>
+    </div>
+
+    <script>
+        const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
+        const ws = new WebSocket(protocol + window.location.host + "/ws/alerts");
+        
+        const statusBadge = document.getElementById("connection-status");
+        const alertsDiv = document.getElementById("alerts");
+        const totalAlertsEl = document.getElementById("total-alerts");
+        const totalCostEl = document.getElementById("total-cost");
+        const efficiencyEl = document.getElementById("efficiency-score");
+
+        let activeCosts = {};
+
+        ws.onopen = () => {
+            statusBadge.innerHTML = '<div class="status-dot"></div> System Online';
+            statusBadge.style.color = "var(--accent-green)";
+            statusBadge.style.background = "#ecfdf5";
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            const time = new Date(data.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const alertId = "alert-" + data.alert_id;
+            const existingCard = document.getElementById(alertId);
+
+            // --- 1. Track Costs ---
+            activeCosts[data.alert_id] = parseFloat(data.cost_rupees);
+            
+            // --- 2. Update Totals ---
+            const totalCost = Object.values(activeCosts).reduce((a, b) => a + b, 0);
+            const alertCount = Object.keys(activeCosts).length;
+            
+            totalCostEl.innerText = "₹" + totalCost.toFixed(2);
+            totalAlertsEl.innerText = alertCount;
+
+            // --- 3. Dynamic Efficiency Score ---
+            // Formula: 100 - (2% per active alert) - (0.5% per ₹10 wasted)
+            // This is realistic and updates smoothly.
+            let penalty = (alertCount * 2) + (totalCost / 20);
+            let score = Math.max(0, 100 - penalty);
+            efficiencyEl.innerText = score.toFixed(0) + "%";
+
+            // Color code the score
+            if(score < 50) efficiencyEl.style.color = "var(--accent-red)";
+            else if(score < 80) efficiencyEl.style.color = "var(--accent-yellow)";
+            else efficiencyEl.style.color = "var(--accent-green)";
+
+            // --- 4. Render Card ---
+            const html = `
+                <div>
+                    <div class="alert-header">
+                        <span class="alert-location">Floor ${data.floor} • Room ${data.room}</span>
+                        <span class="alert-time">${time}</span>
+                    </div>
+                    <div class="alert-message">${data.message}</div>
+                    <div class="alert-stats">
+                        <span class="stat-item">Waste: <b>${data.wasted_kwh.toFixed(2)} kWh</b></span>
+                        <span class="stat-item cost-highlight">Est. Cost: ₹${data.cost_rupees.toFixed(2)}</span>
+                        <span class="stat-item">Confidence: ${(data.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                </div>
+                <div class="priority-badge">${data.priority}</div>
+            `;
+
+            if (existingCard) {
+                existingCard.className = `alert-card ${data.priority}`;
+                existingCard.innerHTML = html;
+            } else {
+                const newCard = document.createElement("div");
+                newCard.id = alertId;
+                newCard.className = `alert-card ${data.priority}`;
+                newCard.innerHTML = html;
+                alertsDiv.prepend(newCard);
+                
+                if (alertsDiv.children.length > 20) {
+                    alertsDiv.lastElementChild.remove();
+                }
+            }
+        };
+
+        ws.onclose = () => {
+            statusBadge.innerHTML = '<div class="status-dot" style="background:red; box-shadow:none;"></div> Connection Lost';
+            statusBadge.style.color = "#b91c1c";
+            statusBadge.style.background = "#fef2f2";
+        };
+    </script>
+</body>
+</html>
+"""
+
+# -----------------------------
+# Data Models
+# -----------------------------
+@dataclass
+class SmartMeterEvent:
+    timestamp: datetime
+    building_id: str
+    floor: int
+    room: str
+    device: str
+    kw: float
+
+@dataclass
+class OccupancyEvent:
+    timestamp: datetime
+    building_id: str
+    floor: int
+    room: str
+    source: str
+    occupied: bool
+    people_count: int
+
+@dataclass
+class Alert:
+    alert_id: str
+    timestamp: datetime
+    building: str
+    floor: int
+    room: str
+    device: str
+    duration_minutes: int
+    wasted_kwh: float
+    cost_rupees: float
+    confidence: float
+    priority: str
+    message: str
+
+# -----------------------------
+# Global State
+# -----------------------------
+meter_queue: asyncio.Queue[SmartMeterEvent] = asyncio.Queue()
+occupancy_queue: asyncio.Queue[OccupancyEvent] = asyncio.Queue()
+
+state: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+room_sensor_state: dict[tuple[str, int, str], dict[str, float]] = defaultdict(
+    lambda: {src: 0.0 for src in SOURCES}
+)
+
+active_alerts: dict[str, Alert] = {}
+alert_history: list[Alert] = []
+websocket_clients: set[WebSocket] = set()
+
+model: LinearRegression | None = None
+background_tasks: list[asyncio.Task] = []
+
+def get_or_init_state(building: str, floor: int, room: str, device: str) -> dict[str, Any]:
+    key = (building, floor, room, device)
+    if key not in state:
+        state[key] = {
+            "last_exit_time": None,
+            "occupancy_score": 0.0,
+            "last_seen_occupancy": None,
+            "device_on_since": None,
+            "rolling_kw": deque(maxlen=6),
+            "wasted_kwh_today": 0.0,
+            "wasted_cost_today": 0.0,
+            "expected_kw": 0.0,
+            "active_alert_id": None,
+            "is_occupied": False,
+            "rule2_counter": 0,
+        }
+    return state[key]
+
+# -----------------------------
+# ML Model
+# -----------------------------
+def train_expected_load_model() -> LinearRegression:
+    random.seed(42)
+    rows = []
+    for _ in range(600):
+        hour = random.randint(0, 23)
+        occupancy_score = random.random()
+        base = 0.6 + 1.8 * occupancy_score
+        day_factor = 0.9 if 8 <= hour <= 19 else 0.4
+        noise = random.uniform(-0.15, 0.15)
+        expected_kw = max(0.1, base * day_factor + noise)
+        rows.append(
+            {
+                "hour_of_day": hour,
+                "occupancy_score": occupancy_score,
+                "expected_kw": expected_kw,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    reg = LinearRegression()
+    reg.fit(df[["hour_of_day", "occupancy_score"]], df["expected_kw"])
+    return reg
+
+# -----------------------------
+# Simulation
+# -----------------------------
+async def occupancy_simulator() -> None:
+    simulated_presence: dict[tuple[int, str], bool] = {(f, r): False for f, r in ROOMS}
+
+    while True:
+        now = datetime.now()
+        for floor, room in ROOMS:
+            hour = now.hour
+            in_hours = 8 <= hour <= 19
+            enter_p = 0.20 if in_hours else 0.03
+            exit_p = 0.12 if in_hours else 0.20
+
+            key = (floor, room)
+            occupied = simulated_presence[key]
+            
+            if occupied and random.random() < exit_p:
+                occupied = False
+            elif not occupied and random.random() < enter_p:
+                occupied = True
+            simulated_presence[key] = occupied
+
+            people = random.randint(1, 8) if occupied else 0
+
+            for source in SOURCES:
+                detected = occupied
+                if random.random() < 0.08:
+                    detected = not detected
+                
+                evt = OccupancyEvent(
+                    timestamp=now,
+                    building_id=BUILDING_ID,
+                    floor=floor,
+                    room=room,
+                    source=source,
+                    occupied=detected,
+                    people_count=people if detected else 0,
+                )
+                await occupancy_queue.put(evt)
+
+        await asyncio.sleep(TICK_SECONDS)
+
+async def meter_simulator() -> None:
+    hvac_should_run: dict[tuple[int, str], bool] = {(f, r): False for f, r in ROOMS}
+
+    while True:
+        now = datetime.now()
+        for floor, room in ROOMS:
+            room_key = (BUILDING_ID, floor, room)
+            sensors = room_sensor_state[room_key]
+            occ_score = sum(SOURCE_WEIGHTS[src] * sensors[src] for src in SOURCES)
+            occupied = occ_score > 0.6
+
+            if occupied:
+                hvac_should_run[(floor, room)] = True
+            else:
+                if random.random() < 0.30:
+                    hvac_should_run[(floor, room)] = True
+                elif random.random() < 0.70:
+                    hvac_should_run[(floor, room)] = False
+
+            if now.hour >= 22 or now.hour <= 5:
+                if random.random() < 0.20:
+                    hvac_should_run[(floor, room)] = True
+
+            if hvac_should_run[(floor, room)]:
+                kw = round(random.uniform(1.2, 3.4), 2)
+            else:
+                kw = round(random.uniform(0.05, 0.30), 2)
+
+            evt = SmartMeterEvent(
+                timestamp=now,
+                building_id=BUILDING_ID,
+                floor=floor,
+                room=room,
+                device="HVAC",
+                kw=kw,
+            )
+            await meter_queue.put(evt)
+
+        await asyncio.sleep(TICK_SECONDS)
+
+# -----------------------------
+# Processing
+# -----------------------------
+def compute_occupancy_score(building: str, floor: int, room: str) -> float:
+    room_key = (building, floor, room)
+    sensors = room_sensor_state[room_key]
+    score = sum(SOURCE_WEIGHTS[src] * sensors[src] for src in SOURCES)
+    return score
+
+async def occupancy_consumer() -> None:
+    while True:
+        evt = await occupancy_queue.get()
+        room_key = (evt.building_id, evt.floor, evt.room)
+        room_sensor_state[room_key][evt.source] = 1.0 if evt.occupied else 0.0
+
+        occupancy_score = compute_occupancy_score(evt.building_id, evt.floor, evt.room)
+        is_occupied = occupancy_score > 0.6
+
+        room_state = get_or_init_state(evt.building_id, evt.floor, evt.room, "HVAC")
+        prev_occupied = room_state["is_occupied"]
+        room_state["occupancy_score"] = occupancy_score
+        room_state["is_occupied"] = is_occupied
+
+        if is_occupied:
+            room_state["last_seen_occupancy"] = evt.timestamp
+        elif prev_occupied and not is_occupied:
+            room_state["last_exit_time"] = evt.timestamp
+
+        occupancy_queue.task_done()
+
+def _serialize_alert(alert: Alert) -> dict[str, Any]:
+    payload = asdict(alert)
+    payload["timestamp"] = alert.timestamp.isoformat()
+    return payload
+
+async def broadcast_alert(alert: Alert) -> None:
+    if not websocket_clients:
+        return
+    payload = _serialize_alert(alert)
+    dead_clients = []
+    for ws in websocket_clients:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead_clients.append(ws)
+    for ws in dead_clients:
+        websocket_clients.discard(ws)
+
+async def evaluate_rules_and_alert(evt: SmartMeterEvent, room_state: dict[str, Any]) -> None:
+    is_occupied = room_state["is_occupied"]
+    now = evt.timestamp
+
+    # Rule 1: VACANT and device ON
+    duration_simulated_minutes = 0
+    if not is_occupied and evt.kw > 0.5 and room_state["last_exit_time"] is not None:
+        duration_simulated_minutes = int((now - room_state["last_exit_time"]).total_seconds())
+
+    rule1 = duration_simulated_minutes >= 15  # Only flag duration if > 15 mins (Simulated)
+    
+    # Rule 2: Baseline Deviation (Overload)
+    expected_kw = max(room_state["expected_kw"], 0.1)
+    if evt.kw > expected_kw * 1.5: 
+        room_state["rule2_counter"] += 1
+    else:
+        room_state["rule2_counter"] = 0
+    rule2 = room_state["rule2_counter"] >= 4
+
+    # Rule 3: Daily Accumulation
+    rule3 = room_state["wasted_kwh_today"] > 2.0
+
+    matched = int(rule1) + int(rule2) + int(rule3)
+    
+    if matched == 0:
+        if room_state.get("active_alert_id"):
+            active_alerts.pop(room_state["active_alert_id"], None)
+            room_state["active_alert_id"] = None
+        return
+
+    # --- SMARTER PRIORITY LOGIC ---
+    if rule3: 
+        priority = "HIGH" # Daily waste limit breached is always HIGH
+    elif rule2:
+        priority = "MED"  # Anomalous load is MEDIUM
+    else:
+        priority = "LOW"  # Just duration is LOW
+
+    confidence = round(min(0.99, 0.50 + 0.15 * matched + (0.1 if rule3 else 0)), 2)
+    cost = round(room_state["wasted_cost_today"], 2)
+    wasted = round(room_state["wasted_kwh_today"], 3)
+
+    if rule3:
+        message = f"Critical: High daily waste detected ({wasted} kWh) in empty room."
+    elif rule2:
+        message = f"Abnormal Load: Running at {evt.kw}kW (Expected: {expected_kw:.2f}kW)"
+    else:
+        message = f"HVAC running for {duration_simulated_minutes} simulated mins in empty room."
+
+    existing_id = room_state.get("active_alert_id")
+    if existing_id and existing_id in active_alerts:
+        existing = active_alerts[existing_id]
+        existing.timestamp = now
+        existing.duration_minutes = duration_simulated_minutes
+        existing.wasted_kwh = wasted
+        existing.cost_rupees = cost
+        existing.priority = priority
+        existing.confidence = confidence
+        existing.message = message
+        await broadcast_alert(existing)
+        return
+
+    new_alert = Alert(
+        alert_id=str(uuid.uuid4()),
+        timestamp=now,
+        building=evt.building_id,
+        floor=evt.floor,
+        room=evt.room,
+        device=evt.device,
+        duration_minutes=duration_simulated_minutes,
+        wasted_kwh=wasted,
+        cost_rupees=cost,
+        confidence=confidence,
+        priority=priority,
+        message=message,
+    )
+    room_state["active_alert_id"] = new_alert.alert_id
+    active_alerts[new_alert.alert_id] = new_alert
+    alert_history.append(new_alert)
+    await broadcast_alert(new_alert)
+
+async def meter_consumer() -> None:
+    global model
+    while True:
+        evt = await meter_queue.get()
+        room_state = get_or_init_state(evt.building_id, evt.floor, evt.room, evt.device)
+        room_state["rolling_kw"].append(evt.kw)
+
+        device_on = evt.kw > 0.5
+        if device_on and room_state["device_on_since"] is None:
+            room_state["device_on_since"] = evt.timestamp
+        if not device_on:
+            room_state["device_on_since"] = None
+
+        if not room_state["is_occupied"] and device_on:
+            wasted_increment_kwh = evt.kw * (SIM_MINUTES_PER_TICK / 60.0)
+            room_state["wasted_kwh_today"] += wasted_increment_kwh
+            room_state["wasted_cost_today"] = room_state["wasted_kwh_today"] * TARIFF_RUPEES_PER_KWH
+
+        hour = evt.timestamp.hour
+        occ_score = room_state["occupancy_score"]
+        expected = float(model.predict([[hour, occ_score]])[0]) if model else 0.5
+        room_state["expected_kw"] = max(expected, 0.1)
+
+        await evaluate_rules_and_alert(evt, room_state)
+        meter_queue.task_done()
+
+# -----------------------------
+# API
+# -----------------------------
+app = FastAPI(title="Energy Waste Detection Demo")
+
+@app.get("/", response_class=HTMLResponse)
+async def get_dashboard():
+    return html_content
+
+@app.websocket("/ws/alerts")
+async def ws_alerts(websocket: WebSocket):
+    await websocket.accept()
+    websocket_clients.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except (WebSocketDisconnect, Exception):
+        websocket_clients.discard(websocket)
+
+@app.on_event("startup")
+async def startup_event():
+    global model
+    model = train_expected_load_model()
+    _ = websockets.__version__ 
+
+    background_tasks.extend(
+        [
+            asyncio.create_task(occupancy_simulator(), name="occupancy_simulator"),
+            asyncio.create_task(meter_simulator(), name="meter_simulator"),
+            asyncio.create_task(occupancy_consumer(), name="occupancy_consumer"),
+            asyncio.create_task(meter_consumer(), name="meter_consumer"),
+        ]
+    )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
